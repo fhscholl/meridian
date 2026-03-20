@@ -184,7 +184,20 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 allowedTools: [...ALLOWED_MCP_TOOLS],
                 mcpServers: {
                   [MCP_SERVER_NAME]: opencodeMcpServer
-                }
+                },
+                // Deny Task tool at SDK level — OpenCode handles subagent delegation.
+                // The tool_use block is still emitted in the stream for OpenCode to handle.
+                canUseTool: async (toolName: string) => {
+                  if (toolName === "Task" || toolName === "task") {
+                    return {
+                      behavior: "deny" as const,
+                      message: "Task delegation is handled by the client. Returning tool_use to client.",
+                    }
+                  }
+                  return {
+                    behavior: "allow" as const,
+                  }
+                },
               }
             })
 
@@ -311,7 +324,18 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   allowedTools: [...ALLOWED_MCP_TOOLS],
                   mcpServers: {
                     [MCP_SERVER_NAME]: opencodeMcpServer
-                  }
+                  },
+                  canUseTool: async (toolName: string) => {
+                    if (toolName === "Task" || toolName === "task") {
+                      return {
+                        behavior: "deny" as const,
+                        message: "Task delegation is handled by the client. Returning tool_use to client.",
+                      }
+                    }
+                    return {
+                      behavior: "allow" as const,
+                    }
+                  },
                 }
               })
 
