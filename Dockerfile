@@ -1,50 +1,49 @@
-FROM ubuntu:24.04
+# ---- Build stage ----
+FROM node:22 AS build
 
-# Avoid interactive prompts
-ENV DEBIAN_FRONTEND=noninteractive
+RUN npm install -g bun \
+    && npm cache clean --force \
+    && useradd -m -s /bin/bash claude \
+    && mkdir -p /home/claude/.claude \
+    && chown -R claude:claude /home/claude
 
-# Install system deps + Node.js
-RUN apt-get update && apt-get install -y \
-    curl \
-    unzip \
-    git \
-    ca-certificates \
-    nodejs \
-    npm \
-    && rm -rf /var/lib/apt/lists/*
+USER claude
+ENV PATH="/home/claude/.bun/bin:$PATH"
 
-# Create non-root user (SDK refuses --dangerously-skip-permissions as root)
+RUN bun install -g @anthropic-ai/claude-code
+
+WORKDIR /app
+COPY --chown=claude:claude package.json bun.lock* ./
+RUN bun install --frozen-lockfile --production || bun install --production
+
+# ---- Runtime stage ----
+FROM node:22-slim
+
+COPY --from=build /usr/local/bin/bun /usr/local/bin/
+
 RUN useradd -m -s /bin/bash claude \
     && mkdir -p /home/claude/.claude \
     && chown -R claude:claude /home/claude
-USER claude
 
-# Install Bun
-RUN curl -fsSL https://bun.sh/install | bash
+COPY --from=build --chown=claude:claude /home/claude/.bun /home/claude/.bun
+
+USER claude
 ENV PATH="/home/claude/.bun/bin:$PATH"
 
-# Install Claude CLI via Bun (npm global doesn't work for non-root)
-RUN bun install -g @anthropic-ai/claude-code
-
-# Set up working directory
 WORKDIR /app
+COPY --from=build --chown=claude:claude /app/node_modules ./node_modules
+COPY --chown=claude:claude package.json ./
+COPY --chown=claude:claude bin/ ./bin/
+COPY --chown=claude:claude src/proxy/ ./src/proxy/
+COPY --chown=claude:claude src/plugin/ ./src/plugin/
+COPY --chown=claude:claude src/logger.ts src/mcpTools.ts ./src/
 
-# Copy package files first (better layer caching)
-COPY --chown=claude:claude package.json bun.lock* ./
-RUN bun install --frozen-lockfile || bun install
-
-# Copy source
-COPY --chown=claude:claude . .
-
-# Expose proxy port
 EXPOSE 3456
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
-    CMD curl -sf http://127.0.0.1:3456/health || exit 1
+    CMD bun -e "const r=await fetch('http://127.0.0.1:3456/health');process.exit(r.ok?0:1)"
 
-# Default: passthrough mode with supervisor
-ENV CLAUDE_PROXY_PASSTHROUGH=1
-ENV CLAUDE_PROXY_HOST=0.0.0.0
+ENV CLAUDE_PROXY_PASSTHROUGH=1 \
+    CLAUDE_PROXY_HOST=0.0.0.0
 ENTRYPOINT ["./bin/docker-entrypoint.sh"]
 CMD ["./bin/claude-proxy-supervisor.sh"]
