@@ -10,8 +10,86 @@ import { existsSync } from "fs"
 import { fileURLToPath } from "url"
 import { join, dirname } from "path"
 import { opencodeMcpServer } from "../mcpTools"
-import { randomUUID } from "crypto"
+import { randomUUID, createHash } from "crypto"
 import { withClaudeLogContext } from "../logger"
+
+// --- Session Tracking ---
+// Maps OpenCode session ID (or fingerprint) → Claude SDK session ID
+interface SessionState {
+  claudeSessionId: string
+  lastAccess: number
+  messageCount: number
+}
+
+const sessionCache = new Map<string, SessionState>()
+const fingerprintCache = new Map<string, SessionState>()
+
+/** Clear all session caches (used in tests) */
+export function clearSessionCache() {
+  sessionCache.clear()
+  fingerprintCache.clear()
+}
+
+// Clean stale sessions every hour — sessions survive a full workday
+const SESSION_TTL_MS = 24 * 60 * 60 * 1000 // 24 hours
+setInterval(() => {
+  const now = Date.now()
+  for (const [key, val] of sessionCache) {
+    if (now - val.lastAccess > SESSION_TTL_MS) sessionCache.delete(key)
+  }
+  for (const [key, val] of fingerprintCache) {
+    if (now - val.lastAccess > SESSION_TTL_MS) fingerprintCache.delete(key)
+  }
+}, 60 * 60 * 1000)
+
+/** Hash the first user message to fingerprint a conversation */
+function getConversationFingerprint(messages: Array<{ role: string; content: any }>): string {
+  const firstUser = messages?.find((m) => m.role === "user")
+  if (!firstUser) return ""
+  const text = typeof firstUser.content === "string"
+    ? firstUser.content
+    : Array.isArray(firstUser.content)
+      ? firstUser.content.filter((b: any) => b.type === "text").map((b: any) => b.text).join("")
+      : ""
+  if (!text) return ""
+  return createHash("sha256").update(text.slice(0, 2000)).digest("hex").slice(0, 16)
+}
+
+/** Look up a cached session by header or fingerprint */
+function lookupSession(
+  opencodeSessionId: string | undefined,
+  messages: Array<{ role: string; content: any }>
+): SessionState | undefined {
+  // Primary: use x-opencode-session header
+  if (opencodeSessionId) {
+    return sessionCache.get(opencodeSessionId)
+  }
+  // Fallback: fingerprint (only when no header is present)
+  const fp = getConversationFingerprint(messages)
+  if (fp) return fingerprintCache.get(fp)
+  return undefined
+}
+
+/** Store a session mapping */
+function storeSession(
+  opencodeSessionId: string | undefined,
+  messages: Array<{ role: string; content: any }>,
+  claudeSessionId: string
+) {
+  if (!claudeSessionId) return
+  const state: SessionState = { claudeSessionId, lastAccess: Date.now(), messageCount: messages?.length || 0 }
+  if (opencodeSessionId) sessionCache.set(opencodeSessionId, state)
+  const fp = getConversationFingerprint(messages)
+  if (fp) fingerprintCache.set(fp, state)
+}
+
+/** Extract only the last user message (for resume — SDK already has history) */
+function getLastUserMessage(messages: Array<{ role: string; content: any }>): Array<{ role: string; content: any }> {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === "user") return [messages[i]!]
+  }
+  return messages.slice(-1)
+}
 
 // Block SDK built-in tools so Claude only uses MCP tools (which have correct param names)
 const BLOCKED_BUILTIN_TOOLS = [
@@ -89,6 +167,12 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         const model = mapModelToClaudeModel(body.model || "sonnet")
         const stream = body.stream ?? true
 
+        // Session resume: look up cached Claude SDK session
+        const opencodeSessionId = c.req.header("x-opencode-session")
+        const cachedSession = lookupSession(opencodeSessionId, body.messages || [])
+        const resumeSessionId = cachedSession?.claudeSessionId
+        const isResume = Boolean(resumeSessionId)
+
         // Debug: log request details
         const msgSummary = body.messages?.map((m: any) => {
           const contentTypes = Array.isArray(m.content)
@@ -96,7 +180,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             : "string"
           return `${m.role}[${contentTypes}]`
         }).join(" → ")
-        console.error(`[PROXY] ${requestMeta.requestId} model=${model} stream=${stream} tools=${body.tools?.length ?? 0} msgs=${msgSummary}`)
+        console.error(`[PROXY] ${requestMeta.requestId} model=${model} stream=${stream} tools=${body.tools?.length ?? 0} resume=${isResume} msgs=${msgSummary}`)
 
         claudeLog("request.received", {
           model,
@@ -134,8 +218,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
         }
       }
 
+      // When resuming, only send the last user message (SDK already has history)
+      const messagesToConvert = isResume
+        ? getLastUserMessage(body.messages || [])
+        : body.messages
+
       // Convert messages to a text prompt, preserving all content types
-      const conversationParts = body.messages
+      const conversationParts = messagesToConvert
         ?.map((m: { role: string; content: string | Array<{ type: string; text?: string; content?: string; tool_use_id?: string; name?: string; input?: unknown; id?: string }> }) => {
           const role = m.role === "assistant" ? "Assistant" : "Human"
           let content: string
@@ -168,6 +257,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           let assistantMessages = 0
           const upstreamStartAt = Date.now()
           let firstChunkAt: number | undefined
+          let currentSessionId: string | undefined
 
           claudeLog("upstream.start", { mode: "non_stream", model })
 
@@ -185,8 +275,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 mcpServers: {
                   [MCP_SERVER_NAME]: opencodeMcpServer
                 },
-                // Deny Task tool at SDK level — OpenCode handles subagent delegation.
-                // The tool_use block is still emitted in the stream for OpenCode to handle.
+                ...(resumeSessionId ? { resume: resumeSessionId } : {}),
                 canUseTool: async (toolName: string) => {
                   if (toolName === "Task" || toolName === "task") {
                     return {
@@ -202,6 +291,10 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             })
 
             for await (const message of response) {
+              // Capture session ID from SDK messages
+              if ((message as any).session_id) {
+                currentSessionId = (message as any).session_id
+              }
               if (message.type === "assistant") {
                 assistantMessages += 1
                 if (!firstChunkAt) {
@@ -264,7 +357,14 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             hasToolUse
           })
 
-          return c.json({
+          // Store session for future resume
+          if (currentSessionId) {
+            storeSession(opencodeSessionId, body.messages || [], currentSessionId)
+          }
+
+          const responseSessionId = currentSessionId || resumeSessionId || `session_${Date.now()}`
+
+          return new Response(JSON.stringify({
             id: `msg_${Date.now()}`,
             type: "message",
             role: "assistant",
@@ -272,6 +372,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             model: body.model,
             stop_reason: stopReason,
             usage: { input_tokens: 0, output_tokens: 0 }
+          }), {
+            headers: {
+              "Content-Type": "application/json",
+              "X-Claude-Session-ID": responseSessionId,
+            }
           })
         }
 
@@ -311,6 +416,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
             }
 
             try {
+              let currentSessionId: string | undefined
               const response = query({
                 prompt,
                 options: {
@@ -325,6 +431,7 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                   mcpServers: {
                     [MCP_SERVER_NAME]: opencodeMcpServer
                   },
+                  ...(resumeSessionId ? { resume: resumeSessionId } : {}),
                   canUseTool: async (toolName: string) => {
                     if (toolName === "Task" || toolName === "task") {
                       return {
@@ -366,6 +473,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 for await (const message of response) {
                   if (streamClosed) {
                     break
+                  }
+
+                  // Capture session ID from any SDK message
+                  if ((message as any).session_id) {
+                    currentSessionId = (message as any).session_id
                   }
 
                   if (message.type === "stream_event") {
@@ -466,6 +578,11 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
                 textEventsForwarded
               })
 
+              // Store session for future resume
+              if (currentSessionId) {
+                storeSession(opencodeSessionId, body.messages || [], currentSessionId)
+              }
+
               if (!streamClosed) {
                 controller.close()
                 streamClosed = true
@@ -531,11 +648,13 @@ export function createProxyServer(config: Partial<ProxyConfig> = {}) {
           }
         })
 
+        const streamSessionId = resumeSessionId || `session_${Date.now()}`
         return new Response(readable, {
           headers: {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
-            Connection: "keep-alive"
+            Connection: "keep-alive",
+            "X-Claude-Session-ID": streamSessionId
           }
         })
       } catch (error) {

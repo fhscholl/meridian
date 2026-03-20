@@ -35,7 +35,8 @@ This project simply calls `query()` from Anthropic's public npm package using yo
 | **Streaming support** | Real-time SSE streaming just like the real API |
 | **Concurrent requests** | Subagents and title generation don't block each other |
 | **Any Anthropic model** | Works with opus, sonnet, and haiku |
-| **Full test coverage** | 37 tests covering tool execution, streaming, subagents, and concurrency |
+| **Session resume** | Conversations persist across requests — faster responses, better context |
+| **Full test coverage** | 46 tests covering tool execution, streaming, subagents, sessions, and concurrency |
 
 ## Prerequisites
 
@@ -145,6 +146,28 @@ When OpenCode uses the `Task` tool to delegate work to a subagent (e.g., `explor
 
 This means subagent delegation works with any agent framework (oh-my-opencode, custom agents, or OpenCode's built-in agents).
 
+### Session Resume
+
+The proxy tracks Claude SDK session IDs and resumes conversations on follow-up requests instead of starting fresh. This means:
+
+- **Faster responses** — no re-processing of the entire conversation history
+- **Better context** — the SDK remembers tool results from previous turns
+- **Less token usage** — only the new user message is sent on resume
+
+Session tracking works two ways:
+
+1. **Header-based** (recommended) — Install the included OpenCode plugin to inject `x-opencode-session` headers:
+
+   ```json
+   {
+     "plugin": ["./path/to/opencode-claude-max-proxy/src/plugin/claude-max-headers.ts"]
+   }
+   ```
+
+2. **Fingerprint-based** (automatic fallback) — The proxy hashes the first user message to identify returning conversations. No configuration needed, but less reliable than headers.
+
+Sessions are cached for 1 hour and cleaned up automatically.
+
 ## Model Mapping
 
 | OpenCode Model | Claude SDK |
@@ -199,11 +222,12 @@ launchctl load ~/Library/LaunchAgents/com.claude-max-proxy.plist
 bun test
 ```
 
-37 tests covering:
+46 tests covering:
 - Tool use forwarding (streaming and non-streaming)
 - MCP tool filtering (internal tools hidden from client)
 - Subagent concurrent request handling
 - Agent name normalization
+- Session resume (header-based and fingerprint-based)
 - Full Anthropic API tool loop simulation
 - Error recovery
 
@@ -307,15 +331,18 @@ grep opencode ~/.zshrc  # Remove any alias lines
 ```
 src/
 ├── proxy/
-│   ├── server.ts    # HTTP server, request handling, SSE streaming, MCP filtering
+│   ├── server.ts    # HTTP server, request handling, SSE streaming, session resume, MCP filtering
 │   └── types.ts     # ProxyConfig types and defaults
 ├── mcpTools.ts      # MCP tool definitions (read, write, edit, bash, glob, grep)
 ├── logger.ts        # Structured logging with AsyncLocalStorage context
-└── __tests__/       # 37 tests across 6 files
+├── plugin/
+│   └── claude-max-headers.ts  # OpenCode plugin for session header injection
+└── __tests__/       # 46 tests across 7 files
     ├── helpers.ts
     ├── integration.test.ts
     ├── proxy-agent-normalization.test.ts
     ├── proxy-mcp-filtering.test.ts
+    ├── proxy-session-resume.test.ts
     ├── proxy-subagent-support.test.ts
     ├── proxy-tool-forwarding.test.ts
     └── proxy-transparent-tools.test.ts
