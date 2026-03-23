@@ -9,8 +9,10 @@
     "claude-max-proxy": "./dist/cli.js"
   },
   "exports": {
-    ".": "./dist/server.js",
-    "./types": "./dist/types.js"
+    ".": {
+      "types": "./dist/proxy/server.d.ts",
+      "default": "./dist/server.js"
+    }
   },
   "engines": {
     "node": ">=22"
