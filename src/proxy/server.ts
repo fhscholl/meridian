@@ -1405,8 +1405,6 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
       console.error(`\nOr use a different port:`)
       console.error(`  CLAUDE_PROXY_PORT=4567 claude-max-proxy`)
     }
-    // Don't re-throw — let the error propagate on the server's event emitter.
-    // Callers can handle it via proxy.server.on("error", ...).
   })
 
   return {
