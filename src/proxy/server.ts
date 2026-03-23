@@ -117,8 +117,7 @@ export function startSessionCleanup(): ReturnType<typeof setInterval> {
   }, 60 * 60 * 1000)
 }
 
-// Start cleanup automatically for backward compat (CLI usage)
-const _defaultCleanupTimer = startSessionCleanup()
+// No module-level timer — cleanup is started per instance in startProxyServer()
 
 /** Hash the first user message to fingerprint a conversation */
 function getConversationFingerprint(messages: Array<{ role: string; content: any }>): string {
@@ -1398,20 +1397,16 @@ export async function startProxyServer(config: Partial<ProxyConfig> = {}): Promi
   const cleanupTimer = startSessionCleanup()
 
   server.on("error", (error: NodeJS.ErrnoException) => {
-    if (error.code === "EADDRINUSE") {
-      if (!finalConfig.silent) {
-        console.error(`\nError: Port ${finalConfig.port} is already in use.`)
-        console.error(`\nIs another instance of the proxy already running?`)
-        console.error(`  Check with: lsof -i :${finalConfig.port}`)
-        console.error(`  Kill it with: kill $(lsof -ti :${finalConfig.port})`)
-        console.error(`\nOr use a different port:`)
-        console.error(`  CLAUDE_PROXY_PORT=4567 claude-max-proxy`)
-      }
-      const err = new Error(`Port ${finalConfig.port} is already in use`) as NodeJS.ErrnoException
-      err.code = "EADDRINUSE"
-      throw err
+    if (error.code === "EADDRINUSE" && !finalConfig.silent) {
+      console.error(`\nError: Port ${finalConfig.port} is already in use.`)
+      console.error(`\nIs another instance of the proxy already running?`)
+      console.error(`  Check with: lsof -i :${finalConfig.port}`)
+      console.error(`  Kill it with: kill $(lsof -ti :${finalConfig.port})`)
+      console.error(`\nOr use a different port:`)
+      console.error(`  CLAUDE_PROXY_PORT=4567 claude-max-proxy`)
     }
-    throw error
+    // Don't re-throw — let the error propagate on the server's event emitter.
+    // Callers can handle it via proxy.server.on("error", ...).
   })
 
   return {
